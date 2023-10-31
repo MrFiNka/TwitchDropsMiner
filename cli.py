@@ -161,7 +161,7 @@ class InventoryHandler(BaseInventoryOverview):
         return status_text, status_color
 
     @staticmethod
-    def get_progress(drop: TimedDrop) -> tuple[str, str]:
+    def update_progress(drop: TimedDrop, label) -> tuple[str, str]:
         progress_color = ""
         if drop.is_claimed:
             progress_color = "green"
@@ -465,7 +465,11 @@ class CLIManager(BaseInterfaceManager):
 
     async def wait_until_closed(self):
         # wait until the user closes the window
-        await self._close_requested.wait()
+        try:
+            await self._close_requested.wait()
+        except asyncio.exceptions.CancelledError:
+            # KeyboardInterrupt
+            pass
 
     async def coro_unless_closed(self, coro: abc.Awaitable[_T]) -> _T:
         # In Python 3.11, we need to explicitly wrap awaitables

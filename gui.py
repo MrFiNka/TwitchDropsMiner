@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 import ctypes
 import asyncio
 import logging
-import webbrowser
 import tkinter as tk
+from pathlib import Path
 from collections import abc
+from textwrap import dedent
 from math import log10, ceil
 from dataclasses import dataclass
 from tkinter.font import Font, nametofont
@@ -31,7 +33,7 @@ from base_ui import BaseInterfaceManager, BaseSettingsPanel, BaseInventoryOvervi
     BaseConsoleOutput, BaseChannelList, BaseTrayIcon, BaseLoginForm, BaseWebsocketStatus, BaseStatusBar
 from cache import ImageCache
 from exceptions import ExitRequest
-from utils import resource_path, set_root_icon, Game, _T
+from utils import resource_path, set_root_icon, webopen, Game, _T
 from constants import (
     SELF_PATH, OUTPUT_FORMATTER, WS_TOPICS_LIMIT, MAX_WEBSOCKETS, WINDOW_TITLE, State
 )
@@ -205,7 +207,7 @@ class PaddedListbox(tk.Listbox):
         return self._frame.grid_forget()
 
     def configure(self, *args: Any, **kwargs: Any) -> Any:
-        options = {}
+        options: dict[str, Any] = {}
         if args and args[0] is not None:
             options.update(args[0])
         if kwargs:
@@ -258,16 +260,70 @@ class PaddedListbox(tk.Listbox):
 
 class MouseOverLabel(ttk.Label):
     def __init__(self, *args, alt_text: str = '', reverse: bool = False, **kwargs) -> None:
-        self._org_text: str = kwargs.get("text", '')
-        self._alt_text: str = alt_text
+        self._org_text: str = ''
+        self._alt_text: str = ''
+        self._alt_reverse: bool = reverse
+        self._bind_enter: str | None = None
+        self._bind_leave: str | None = None
         super().__init__(*args, **kwargs)
-        if reverse:
-            self.bind("<Enter>", lambda e: self.config(text=self._org_text))
-            self.bind("<Leave>", lambda e: self.config(text=self._alt_text))
-            self.config(text=self._alt_text)
-        else:
-            self.bind("<Enter>", lambda e: self.config(text=self._alt_text))
-            self.bind("<Leave>", lambda e: self.config(text=self._org_text))
+        self.configure(text=kwargs.get("text", ''), alt_text=alt_text, reverse=reverse)
+
+    def _set_org(self, event: tk.Event[MouseOverLabel]):
+        super().config(text=self._org_text)
+
+    def _set_alt(self, event: tk.Event[MouseOverLabel]):
+        super().config(text=self._alt_text)
+
+    def configure(self, *args: Any, **kwargs: Any) -> Any:
+        options: dict[str, Any] = {}
+        if args and args[0] is not None:
+            options.update(args[0])
+        if kwargs:
+            options.update(kwargs)
+        applicable_options: set[str] = set((
+            "text",
+            "reverse",
+            "alt_text",
+        ))
+        if applicable_options.intersection(options.keys()):
+            # we need to pop some options, because they can't be passed down to the label,
+            # as that will result in an error later down the line
+            events_change: bool = False
+            if "text" in options:
+                if bool(self._org_text) != bool(options["text"]):
+                    events_change = True
+                self._org_text = options["text"]
+            if "alt_text" in options:
+                if bool(self._alt_text) != bool(options["alt_text"]):
+                    events_change = True
+                self._alt_text = options.pop("alt_text")
+            if "reverse" in options:
+                if bool(self._alt_reverse) != bool(options["reverse"]):
+                    events_change = True
+                self._alt_reverse = options.pop("reverse")
+            if self._org_text and not self._alt_text:
+                options["text"] = self._org_text
+            elif (not self._org_text or self._alt_reverse) and self._alt_text:
+                options["text"] = self._alt_text
+            if events_change:
+                if self._bind_enter is not None:
+                    self.unbind(self._bind_enter)
+                    self._bind_enter = None
+                if self._bind_leave is not None:
+                    self.unbind(self._bind_leave)
+                    self._bind_leave = None
+                if self._org_text and self._alt_text:
+                    if self._alt_reverse:
+                        self._bind_enter = self.bind("<Enter>", self._set_org)
+                        self._bind_leave = self.bind("<Leave>", self._set_alt)
+                    else:
+                        self._bind_enter = self.bind("<Enter>", self._set_alt)
+                        self._bind_leave = self.bind("<Leave>", self._set_org)
+        return super().configure(options)
+
+    def config(self, *args: Any, **kwargs: Any) -> Any:
+        # because 'config = configure' makes mypy complain
+        self.configure(*args, **kwargs)
 
 
 class LinkLabel(ttk.Label):
@@ -285,10 +341,7 @@ class LinkLabel(ttk.Label):
             # W, N, E, S
             kwargs["padding"] = (0, 2, 0, 2)
         super().__init__(*args, **kwargs)
-        self.bind("<ButtonRelease-1>", self.webopen(self._link))
-
-    def webopen(self, url: str):
-        return lambda e: webbrowser.open_new_tab(url)
+        self.bind("<ButtonRelease-1>", lambda e: webopen(self._link))
 
 
 class SelectMenu(tk.Menubutton, Generic[_T]):
@@ -301,7 +354,7 @@ class SelectMenu(tk.Menubutton, Generic[_T]):
         command: abc.Callable[[_T], Any] | None = None,
         default: str | None = None,
         relief: tk._Relief = "solid",
-        background: tk._Color = "white",
+        background: str = "white",
         **kwargs: Any,
     ):
         width = max((len(k) for k in options.keys()), default=20)
@@ -499,7 +552,7 @@ class LoginForm(BaseLoginForm):
         self._manager.print(_("gui", "login", "request"))
         await self.wait_for_login_press()
         self._manager.print(f"Enter this code on the Twitch's device activation page: {user_code}")
-        webbrowser.open_new_tab("https://www.twitch.tv/activate")
+        webopen("https://www.twitch.tv/activate")
 
     def update(self, status: str, user_id: int | None):
         if user_id is not None:
@@ -989,10 +1042,8 @@ class TrayIcon(BaseTrayIcon):
         self._button.grid(column=0, row=0, sticky="ne")
 
     def __del__(self) -> None:
+        self.stop()
         self.icon_image.close()
-
-    def is_tray(self) -> bool:
-        return self.icon is not None
 
     def get_title(self, drop: TimedDrop | None) -> str:
         if drop is None:
@@ -1005,22 +1056,22 @@ class TrayIcon(BaseTrayIcon):
             f"{drop.progress:.1%} ({campaign.claimed_drops}/{campaign.total_drops})"
         )
 
-    def start(self):
-        if self.icon is None:
-            loop = asyncio.get_running_loop()
-            drop = self._manager.progress._drop
+    def _start(self):
+        loop = asyncio.get_running_loop()
+        drop = self._manager.progress._drop
 
-            # we need this because tray icon lives in a separate thread
-            def bridge(func):
-                return lambda: loop.call_soon_threadsafe(func)
+        # we need this because tray icon lives in a separate thread
+        def bridge(func):
+            return lambda: loop.call_soon_threadsafe(func)
 
-            menu = pystray.Menu(
-                pystray.MenuItem(_("gui", "tray", "show"), bridge(self.restore), default=True),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem(_("gui", "tray", "quit"), bridge(self.quit)),
-            )
-            self.icon = pystray.Icon("twitch_miner", self.icon_image, self.get_title(drop), menu)
-            self.icon.run_detached()
+        menu = pystray.Menu(
+            pystray.MenuItem(_("gui", "tray", "show"), bridge(self.restore), default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(_("gui", "tray", "quit"), bridge(self.quit)),
+        )
+        self.icon = pystray.Icon("twitch_miner", self.icon_image, self.get_title(drop), menu)
+        # self.icon.run_detached()
+        loop.run_in_executor(None, self.icon.run)
 
     def stop(self):
         if self.icon is not None:
@@ -1031,13 +1082,16 @@ class TrayIcon(BaseTrayIcon):
         self._manager.close()
 
     def minimize(self):
-        if not self.is_tray():
-            self.start()
-            self._manager._root.withdraw()
+        if self.icon is None:
+            self._start()
+        else:
+            self.icon.visible = True
+        self._manager._root.withdraw()
 
     def restore(self):
-        if self.is_tray():
-            self.stop()
+        if self.icon is not None:
+            # self.stop()
+            self.icon.visible = False
         self._manager._root.deiconify()
 
     def notify(
@@ -1047,7 +1101,7 @@ class TrayIcon(BaseTrayIcon):
         if not self._manager._twitch.settings.tray_notifications:
             return None
         if self.icon is not None:
-            icon = self.icon
+            icon = self.icon  # nonlocal scope bind
 
             async def notifier():
                 icon.notify(message, title)
@@ -1095,9 +1149,9 @@ class InventoryOverview(BaseInventoryOverview):
         self._cache: ImageCache = manager._cache
         self._settings: Settings = manager._twitch.settings
         self._filters = {
-            "linked": IntVar(master, 1),
+            "not_linked": IntVar(master, 1),
             "upcoming": IntVar(master, 1),
-            "expired": IntVar(master, 0),
+            "expired": IntVar(master, 1),
             "excluded": IntVar(master, 0),
             "finished": IntVar(master, 0),
         }
@@ -1113,11 +1167,11 @@ class InventoryOverview(BaseInventoryOverview):
         ).grid(column=0, row=0)
         icolumn = 0
         ttk.Checkbutton(
-            filter_frame, variable=self._filters["linked"]
+            filter_frame, variable=self._filters["not_linked"]
         ).grid(column=(icolumn := icolumn + 1), row=0)
         ttk.Label(
             filter_frame,
-            text=_("gui", "inventory", "filter", "linked"),
+            text=_("gui", "inventory", "filter", "not_linked"),
             padding=(0, 0, LABEL_SPACING, 0),
         ).grid(column=(icolumn := icolumn + 1), row=0)
         ttk.Checkbutton(
@@ -1173,19 +1227,19 @@ class InventoryOverview(BaseInventoryOverview):
         self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
         self._canvas.create_window(0, 0, anchor="nw", window=self._main_frame)
         self._campaigns: dict[DropsCampaign, CampaignDisplay] = {}
-        self._drops: dict[str, ttk.Label] = {}
+        self._drops: dict[str, MouseOverLabel] = {}
 
     def _update_visibility(self, campaign: DropsCampaign):
         # True if the campaign is supposed to show, False makes it hidden.
         frame = self._campaigns[campaign]["frame"]
-        linked = bool(self._filters["linked"].get())
+        not_linked = bool(self._filters["not_linked"].get())
         expired = bool(self._filters["expired"].get())
         excluded = bool(self._filters["excluded"].get())
         upcoming = bool(self._filters["upcoming"].get())
         finished = bool(self._filters["finished"].get())
         priority_only = self._settings.priority_only
         if (
-            (not linked or campaign.linked)
+            (not_linked or campaign.linked)
             and (campaign.active or upcoming and campaign.upcoming or expired and campaign.expired)
             and (
                 excluded or (
@@ -1314,10 +1368,8 @@ class InventoryOverview(BaseInventoryOverview):
                 ttk.Label(
                     benefits_frame, text=benefit.name, image=image, compound="bottom"
                 ).grid(column=i, row=0, padx=5)
-            progress_text, progress_color = self.get_progress(drop)
-            self._drops[drop.id] = label = ttk.Label(
-                drop_frame, text=progress_text, foreground=progress_color
-            )
+            self._drops[drop.id] = label = MouseOverLabel(drop_frame)
+            self.update_progress(drop, label)
             label.grid(column=0, row=1)
         self._campaigns[campaign] = {
             "frame": campaign_frame,
@@ -1337,7 +1389,7 @@ class InventoryOverview(BaseInventoryOverview):
     def get_status(campaign: DropsCampaign) -> tuple[str, tk._Color]:
         if campaign.active:
             status_text: str = _("gui", "inventory", "status", "active")
-            status_color: tk._Color = "green"
+            status_color: str = "green"
         elif campaign.upcoming:
             status_text = _("gui", "inventory", "status", "upcoming")
             status_color = "goldenrod"
@@ -1347,9 +1399,12 @@ class InventoryOverview(BaseInventoryOverview):
         return (status_text, status_color)
 
     @staticmethod
-    def get_progress(drop: TimedDrop) -> tuple[str, tk._Color]:
+    def update_progress(drop: TimedDrop, label: MouseOverLabel) -> None:
+        # Returns: main text, alt text, text color
+        alt_text: str = ''
         progress_text: str
-        progress_color: tk._Color = ''
+        reverse: bool = False
+        progress_color: str = ''
         if drop.is_claimed:
             progress_color = "green"
             progress_text = _("gui", "inventory", "status", "claimed")
@@ -1365,14 +1420,27 @@ class InventoryOverview(BaseInventoryOverview):
             progress_text = _("gui", "inventory", "minutes_progress").format(
                 minutes=drop.required_minutes
             )
-        return (progress_text, progress_color)
+            if datetime.now(timezone.utc) < drop.starts_at > drop.campaign.starts_at:
+                # this drop can only be earned later than the campaign start
+                alt_text = _("gui", "inventory", "starts").format(
+                    time=drop.starts_at.astimezone().replace(microsecond=0, tzinfo=None)
+                )
+                reverse = True
+            elif drop.ends_at < drop.campaign.ends_at:
+                # this drop becomes unavailable earlier than the campaign ends
+                alt_text = _("gui", "inventory", "ends").format(
+                    time=drop.ends_at.astimezone().replace(microsecond=0, tzinfo=None)
+                )
+                reverse = True
+        label.config(
+            text=progress_text, alt_text=alt_text, reverse=reverse, foreground=progress_color
+        )
 
     def update_drop(self, drop: TimedDrop) -> None:
         label = self._drops.get(drop.id)
         if label is None:
             return
-        progress_text, progress_color = self.get_progress(drop)
-        label.config(text=progress_text, foreground=progress_color)
+        self.update_progress(drop, label)
 
 
 def proxy_validate(entry: PlaceholderEntry, settings: Settings) -> bool:
@@ -1567,6 +1635,12 @@ class SettingsPanel(BaseSettingsPanel):
     def update_notifications(self) -> None:
         self._settings.tray_notifications = bool(self._vars["tray_notifications"].get())
 
+    def _get_autostart_path(self, tray: bool) -> str:
+        self_path = f'"{SELF_PATH.resolve()!s}"'
+        if tray:
+            self_path += " --tray"
+        return self_path
+
     def update_autostart(self) -> None:
         enabled = bool(self._vars["autostart"].get())
         tray = bool(self._vars["tray"].get())
@@ -1575,14 +1649,34 @@ class SettingsPanel(BaseSettingsPanel):
         if sys.platform == "win32":
             if enabled:
                 # NOTE: we need double quotes in case the path contains spaces
-                self_path = f'"{SELF_PATH.resolve()!s}"'
-                if tray:
-                    self_path += " --tray"
+                autostart_path = self._get_autostart_path(tray)
                 with RegistryKey(self.AUTOSTART_KEY) as key:
-                    key.set(self.AUTOSTART_NAME, ValueType.REG_SZ, self_path)
+                    key.set(self.AUTOSTART_NAME, ValueType.REG_SZ, autostart_path)
             else:
                 with RegistryKey(self.AUTOSTART_KEY) as key:
                     key.delete(self.AUTOSTART_NAME, silent=True)
+        elif sys.platform == "linux":
+            autostart_folder: Path = Path("~/.config/autostart").expanduser()
+            if (config_home := os.environ.get("XDG_CONFIG_HOME")) is not None:
+                config_autostart: Path = Path(config_home, "autostart").expanduser()
+                if config_autostart.exists():
+                    autostart_folder = config_autostart
+            autostart_file: Path = autostart_folder / f"{self.AUTOSTART_NAME}.desktop"
+            if enabled:
+                autostart_path = self._get_autostart_path(tray)
+                file_contents = dedent(
+                    f"""
+                    [Desktop Entry]
+                    Type=Application
+                    Name=Twitch Drops Miner
+                    Description=Mine timed drops on Twitch
+                    Exec=sh -c '{autostart_path}'
+                    """
+                )
+                with autostart_file.open("w", encoding="utf8") as file:
+                    file.write(file_contents)
+            else:
+                autostart_file.unlink(missing_ok=True)
 
     def set_games(self, games: abc.Iterable[Game]) -> None:
         games_list = sorted(map(str, games))
@@ -1778,7 +1872,7 @@ class GUIManager(BaseInterfaceManager):
         self._twitch: Twitch = twitch
         self._poll_task: asyncio.Task[NoReturn] | None = None
         self._close_requested = asyncio.Event()
-        self._root = root = Tk()
+        self._root = root = Tk(className=WINDOW_TITLE)
         # withdraw immediately to prevent the window from flashing
         self._root.withdraw()
         # root.resizable(False, True)
@@ -1896,6 +1990,7 @@ class GUIManager(BaseInterfaceManager):
             # ctypes.windll.user32.ShutdownBlockReasonDestroy(self._handle)
         else:
             # use old-style window closing protocol for non-windows platforms
+            root.protocol("WM_DELETE_WINDOW", self.close)
             root.protocol("WM_DESTROY_WINDOW", self.close)
         # stay hidden in tray if needed, otherwise show the window when everything's ready
         if self._twitch.settings.tray:

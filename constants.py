@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sys
+import random
 import logging
 from pathlib import Path
 from copy import deepcopy
 from enum import Enum, auto
 from datetime import timedelta
-from typing import Any, Dict, Literal, NamedTuple, NewType, TYPE_CHECKING
+from typing import Any, Dict, Literal, NewType, TYPE_CHECKING
 
 from yarl import URL
 
@@ -47,6 +48,30 @@ def _resource_path(relative_path: Path | str) -> Path:
     return base_path.joinpath(relative_path)
 
 
+def _merge_vars(base_vars: JsonType, vars: JsonType) -> None:
+    # NOTE: This modifies base in place
+    for k, v in vars.items():
+        if k not in base_vars:
+            base_vars[k] = v
+        elif isinstance(v, dict):
+            if isinstance(base_vars[k], dict):
+                _merge_vars(base_vars[k], v)
+            elif base_vars[k] is Ellipsis:
+                # unspecified base, use the passed in var
+                base_vars[k] = v
+            else:
+                raise RuntimeError(f"Var is a dict, base is not: '{k}'")
+        elif isinstance(base_vars[k], dict):
+            raise RuntimeError(f"Base is a dict, var is not: '{k}'")
+        else:
+            # simple overwrite
+            base_vars[k] = v
+    # ensure none of the vars are ellipsis (unset value)
+    for k, v in base_vars.items():
+        if v is Ellipsis:
+            raise RuntimeError(f"Unspecified variable: '{k}'")
+
+
 # Base Paths
 # NOTE: pyinstaller will set this to its own executable when building,
 # detect this to use __file__ and main.py redirection instead
@@ -63,6 +88,7 @@ LANG_PATH = _resource_path("lang")
 # Other Paths
 LOG_PATH = Path(WORKING_DIR, "log.txt")
 CACHE_PATH = Path(WORKING_DIR, "cache")
+LOCK_PATH = Path(WORKING_DIR, "lock.file")
 CACHE_DB = Path(CACHE_PATH, "mapping.json")
 COOKIES_PATH = Path(WORKING_DIR, "cookies.jar")
 SETTINGS_PATH = Path(WORKING_DIR, "settings.json")
@@ -79,14 +105,13 @@ MAX_TOPICS = (MAX_WEBSOCKETS * WS_TOPICS_LIMIT) - BASE_TOPICS
 MAX_CHANNELS = MAX_TOPICS // TOPICS_PER_CHANNEL
 # Misc
 DEFAULT_LANG = "English"
-BASE_URL = URL("https://twitch.tv")
+BASE_URL = URL("https://www.twitch.tv")
 # Intervals and Delays
 PING_INTERVAL = timedelta(minutes=3)
 PING_TIMEOUT = timedelta(seconds=10)
 ONLINE_DELAY = timedelta(seconds=120)
 WATCH_INTERVAL = timedelta(seconds=59)
 # Strings
-DROPS_ENABLED_TAG = "c2542d6d-cd10-4532-919b-3d19f30a768b"
 WINDOW_TITLE = f"Twitch Drops Miner v{__version__} (by DevilXD)"
 # Logging
 FILE_FORMATTER = logging.Formatter(
@@ -97,20 +122,65 @@ FILE_FORMATTER = logging.Formatter(
 OUTPUT_FORMATTER = logging.Formatter("{levelname}: {message}", style='{', datefmt="%H:%M:%S")
 
 
-class ClientInfo(NamedTuple):
-    CLIENT_ID: str
-    USER_AGENT: str
+class ClientInfo:
+    def __init__(self, client_url: URL, client_id: str, user_agents: str | list[str]) -> None:
+        self.CLIENT_URL: URL = client_url
+        self.CLIENT_ID: str = client_id
+        self.USER_AGENT: str
+        if isinstance(user_agents, list):
+            self.USER_AGENT = random.choice(user_agents)
+        else:
+            self.USER_AGENT = user_agents
+
+    def __iter__(self):
+        return iter((self.CLIENT_URL, self.CLIENT_ID, self.USER_AGENT))
 
 
 class ClientType:
     WEB = ClientInfo(
+        BASE_URL,
         "kimne78kx3ncx6brgo4mv6wki5h1ko",
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
         ),
     )
-    ANDROID = ClientInfo(
+    MOBILE_WEB = ClientInfo(
+        URL("https://m.twitch.tv"),
+        "r8s4dac0uhzifbpu9sjdiwzctle17ff",
+        [
+            (
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; SM-A205U) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; SM-A102U) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; SM-G960U) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; SM-N960U) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; LM-Q720) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; LM-X420) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/115.0.5790.166 Mobile Safari/537.36"
+            ),
+        ]
+    )
+    ANDROID_APP = ClientInfo(
+        BASE_URL,
         "kd1unb4b3q4t58fwlpcbzcbnm76a8fp",
         (
             "Dalvik/2.1.0 (Linux; U; Android 7.1.2; SM-G977N Build/LMY48Z) "
@@ -118,6 +188,7 @@ class ClientType:
         ),
     )
     SMARTBOX = ClientInfo(
+        URL("https://android.tv.twitch.tv"),
         "ue6666qo983tsx6so1t0vnawi233wa",
         (
             "Mozilla/5.0 (Linux; Android 7.1; Smart Box C1) AppleWebKit/537.36 "
@@ -154,7 +225,7 @@ class GQLOperation(JsonType):
         modified = deepcopy(self)
         if "variables" in self:
             existing_variables: JsonType = modified["variables"]
-            existing_variables.update(variables)
+            _merge_vars(existing_variables, variables)
         else:
             modified["variables"] = variables
         return modified
@@ -226,9 +297,9 @@ GQL_OPERATIONS: dict[str, GQLOperation] = {
         },
     ),
     # returns drops available for a particular channel (unused)
-    "ChannelDrops": GQLOperation(
+    "AvailableDrops": GQLOperation(
         "DropsHighlightService_AvailableDrops",
-        "e589e213f16d9b17c6f0a8ccd18bdd6a8a6b78bc9db67a75efd43793884ff4e5",
+        "9a62a09bce5b53e26e64a671e530bc599cb6aab1e5ba3cbd5d85966d3940716f",
         variables={
             "channelID": ...,  # channel ID as a str
         },
@@ -236,15 +307,18 @@ GQL_OPERATIONS: dict[str, GQLOperation] = {
     # returns live channels for a particular game
     "GameDirectory": GQLOperation(
         "DirectoryPage_Game",
-        "df4bb6cc45055237bfaf3ead608bbafb79815c7100b6ee126719fac3762ddf8b",
+        "3c9a94ee095c735e43ed3ad6ce6d4cbd03c4c6f754b31de54993e0d48fd54e30",
         variables={
             "limit": ...,  # limit of channels returned
-            "name": ...,  # game name
+            "slug": ...,  # game slug
+            "imageWidth": 50,
             "options": {
+                "broadcasterLanguages": [],
+                "freeformTags": None,
                 "includeRestricted": ["SUB_ONLY_LIVE"],
                 "recommendationsContext": {"platform": "web"},
                 "sort": "RELEVANCE",
-                "tags": [],  # list of tag IDs
+                "tags": [],
                 "requestID": "JIRA-VXP-2397",
             },
             "sortTypeIsRecency": False,

@@ -15,18 +15,19 @@ if __name__ == "__main__":
     import traceback
     import tkinter as tk
     from tkinter import messagebox
-    from typing import IO, NoReturn
+    from typing import IO
 
-    if sys.platform == "win32":
-        import win32gui
+    if sys.platform == "linux" and sys.version_info >= (3, 10):
+        import truststore
+        truststore.inject_into_ssl()
 
     from translate import _
     from twitch import Twitch
     from settings import Settings
     from version import __version__
     from exceptions import CaptchaRequired
-    from utils import resource_path, set_root_icon
-    from constants import CALL, SELF_PATH, FILE_FORMATTER, LOG_PATH, WINDOW_TITLE
+    from utils import lock_file, resource_path, set_root_icon
+    from constants import CALL, SELF_PATH, FILE_FORMATTER, LOG_PATH, LOCK_PATH
 
     warnings.simplefilter("default", ResourceWarning)
 
@@ -127,9 +128,6 @@ if __name__ == "__main__":
     parser.add_argument("--cli", action="store_true")
     # undocumented debug args
     parser.add_argument(
-        "--no-run-check", dest="no_run_check", action="store_true", help=argparse.SUPPRESS
-    )
-    parser.add_argument(
         "--debug-ws", dest="_debug_ws", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -155,71 +153,71 @@ if __name__ == "__main__":
     # get rid of unneeded objects
     del parser
 
-    # check if we're not already running
-    if sys.platform == "win32":
+    # client run
+    async def main():
+        # set language
         try:
-            exists = win32gui.FindWindow(None, WINDOW_TITLE)
-        except AttributeError:
-            # we're not on Windows - continue
-            exists = False
-        if exists and not settings.no_run_check:
+            _.set_language(settings.language)
+        except ValueError:
+            # this language doesn't exist - stick to English
+            pass
+
+        # handle logging stuff
+        if settings.logging_level > logging.DEBUG:
+            # redirect the root logger into a NullHandler, effectively ignoring all logging calls
+            # that aren't ours. This always runs, unless the main logging level is DEBUG or lower.
+            logging.getLogger().addHandler(logging.NullHandler())
+        logger = logging.getLogger("TwitchDrops")
+        logger.setLevel(settings.logging_level)
+        if settings.log:
+            handler = logging.FileHandler(LOG_PATH)
+            handler.setFormatter(FILE_FORMATTER)
+            logger.addHandler(handler)
+        logging.getLogger("TwitchDrops.gql").setLevel(settings.debug_gql)
+        logging.getLogger("TwitchDrops.websocket").setLevel(settings.debug_ws)
+
+        exit_status = 0
+        client = Twitch(settings)
+        loop = asyncio.get_running_loop()
+        if sys.platform == "linux":
+            loop.add_signal_handler(signal.SIGINT, lambda *_: client.gui.close())
+            loop.add_signal_handler(signal.SIGTERM, lambda *_: client.gui.close())
+        try:
+            await client.run()
+        except CaptchaRequired:
+            exit_status = 1
+            client.prevent_close()
+            client.print(_("error", "captcha"))
+        except Exception:
+            exit_status = 1
+            client.prevent_close()
+            client.print("Fatal error encountered:\n")
+            client.print(traceback.format_exc())
+        finally:
+            if sys.platform == "linux":
+                loop.remove_signal_handler(signal.SIGINT)
+                loop.remove_signal_handler(signal.SIGTERM)
+            client.print(_("gui", "status", "exiting"))
+            await client.shutdown()
+        if not client.gui.close_requested:
+            client.print(_("status", "terminated"))
+            client.gui.status.update(_("gui", "status", "terminated"))
+        await client.gui.wait_until_closed()
+        # save the application state
+        # NOTE: we have to do it after wait_until_closed,
+        # because the user can alter some settings between app termination and closing the window
+        client.save(force=True)
+        client.gui.stop()
+        client.gui.close_window()
+        sys.exit(exit_status)
+
+    try:
+        # use lock_file to check if we're not already running
+        success, file = lock_file(LOCK_PATH)
+        if not success:
             # already running - exit
             sys.exit(3)
 
-    # set language
-    try:
-        _.set_language(settings.language)
-    except ValueError:
-        # this language doesn't exist - stick to English
-        pass
-
-    # handle logging stuff
-    if settings.logging_level > logging.DEBUG:
-        # redirect the root logger into a NullHandler, effectively ignoring all logging calls
-        # that aren't ours. This always runs, unless the main logging level is DEBUG or lower.
-        logging.getLogger().addHandler(logging.NullHandler())
-    logger = logging.getLogger("TwitchDrops")
-    logger.setLevel(settings.logging_level)
-    if settings.log:
-        handler = logging.FileHandler(LOG_PATH)
-        handler.setFormatter(FILE_FORMATTER)
-        logger.addHandler(handler)
-    logging.getLogger("TwitchDrops.gql").setLevel(settings.debug_gql)
-    logging.getLogger("TwitchDrops.websocket").setLevel(settings.debug_ws)
-
-    # client run
-    exit_status = 0
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    client = Twitch(settings)
-    signal.signal(signal.SIGINT, lambda *_: client.gui.close())
-    signal.signal(signal.SIGTERM, lambda *_: client.gui.close())
-    try:
-        loop.run_until_complete(client.run())
-    except CaptchaRequired:
-        exit_status = 1
-        client.prevent_close()
-        client.print(_("error", "captcha"))
-    except Exception:
-        exit_status = 1
-        client.prevent_close()
-        client.print("Fatal error encountered:\n")
-        client.print(traceback.format_exc())
+        asyncio.run(main())
     finally:
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        client.print(_("gui", "status", "exiting"))
-        loop.run_until_complete(client.shutdown())
-    if not client.gui.close_requested:
-        client.print(_("status", "terminated"))
-        client.gui.status.update(_("gui", "status", "terminated"))
-    loop.run_until_complete(client.gui.wait_until_closed())
-    # save the application state
-    # NOTE: we have to do it after wait_until_closed,
-    # because the user can alter some settings between app termination and closing the window
-    client.save(force=True)
-    client.gui.stop()
-    client.gui.close_window()
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-    sys.exit(exit_status)
+        file.close()

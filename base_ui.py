@@ -147,7 +147,7 @@ class BaseInventoryOverview(metaclass=ABCMeta):
 
     @staticmethod
     @abstractmethod
-    def get_progress(drop):
+    def update_progress(drop, label):
         pass
 
     @abstractmethod
