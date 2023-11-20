@@ -1151,7 +1151,7 @@ class InventoryOverview(BaseInventoryOverview):
         self._filters = {
             "not_linked": IntVar(master, 1),
             "upcoming": IntVar(master, 1),
-            "expired": IntVar(master, 1),
+            "expired": IntVar(master, 0),
             "excluded": IntVar(master, 0),
             "finished": IntVar(master, 0),
         }
