@@ -628,7 +628,7 @@ class Twitch:
                 if self.settings.dump:
                     self.gui.close()
                     continue
-                self.gui.tray.change_icon("idle")
+                //self.gui.tray.change_icon("idle")
                 self.gui.status.update(_("gui", "status", "idle"))
                 self.stop_watching()
                 # clear the flag and wait until it's set again
